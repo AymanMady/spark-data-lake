@@ -1,0 +1,13 @@
+# Application dependencies installed INSIDE the Docker image.
+# PySpark is NOT here: it already ships with the apache/spark image
+# (installing pyspark through pip as well would create two competing versions).
+
+faker==30.8.2            # realistic data generation (phase 2)
+pandas==2.2.3            # Pandas vs Spark comparison (phase 16) + small utilities
+numpy==2.1.3             # vectorised dataset generation (phase 2)
+pyarrow==17.0.0          # Parquet engine on the Python side (reads/writes outside Spark)
+python-dotenv==1.0.1     # loading the .env file (PostgreSQL credentials)
+psycopg2-binary==2.9.10  # PostgreSQL driver on the Python side (checks/tests)
+pytest==8.3.3            # tests (phase 15)
+jupyterlab==4.2.5        # exploration notebook (phase 4)
+matplotlib==3.9.2        # notebook charts

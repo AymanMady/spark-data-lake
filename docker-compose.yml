@@ -1,0 +1,161 @@
+# =============================================================================
+#  Spark Data Lake - full local environment
+#
+#    spark-master  : the "conductor" of the cluster
+#    spark-worker  : the machine that provides CPU + RAM and runs the tasks
+#    spark-app     : the client the jobs are launched from (the driver)
+#    postgres      : the data warehouse (final destination of the Gold data)
+#
+#  Start: docker compose up -d        Stop: docker compose down
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # SPARK MASTER
+  # It runs NO computation. It keeps the registry of available workers and
+  # allocates resources (cores + RAM) to the applications that connect.
+  # ---------------------------------------------------------------------------
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HOST_UID: ${HOST_UID:-1000}
+        HOST_GID: ${HOST_GID:-1000}
+    image: spark-data-lake:3.5.6
+    container_name: sdl-spark-master
+    hostname: spark-master
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    ports:
+      # RPC port: this is what spark://spark-master:7077 targets
+      - "${SPARK_MASTER_HOST_PORT:-7077}:7077"
+      # Master web UI -> http://localhost:8090
+      - "${SPARK_MASTER_UI_PORT:-8090}:8080"
+    volumes:
+      - ./:/opt/workspace
+      - ./docker/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    healthcheck:
+      # Bash can open a TCP socket: if port 8080 answers, the master is ready.
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/8080' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [sdl-net]
+
+  # ---------------------------------------------------------------------------
+  # SPARK WORKER
+  # It registers with the master and advertises its resources. When an
+  # application starts, the worker launches EXECUTORS that run the TASKS.
+  # To scale: docker compose up -d --scale spark-worker=2
+  # (in that case, drop container_name, which prevents duplication).
+  # ---------------------------------------------------------------------------
+  spark-worker:
+    image: spark-data-lake:3.5.6
+    container_name: sdl-spark-worker
+    hostname: spark-worker
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --cores
+      - "${SPARK_WORKER_CORES:-4}"
+      - --memory
+      - "${SPARK_WORKER_MEMORY:-4G}"
+      - --webui-port
+      - "8081"
+    ports:
+      # Worker web UI -> http://localhost:8091
+      - "${SPARK_WORKER_UI_PORT:-8091}:8081"
+    volumes:
+      # CRITICAL: the worker must see EXACTLY the same /opt/workspace/data path
+      # as the driver. Our "data lake" is a local folder: if the executor does
+      # not see the file, the job fails with FileNotFoundException.
+      # (This is precisely the problem HDFS and S3 solve in production.)
+      - ./:/opt/workspace
+      - ./docker/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    networks: [sdl-net]
+
+  # ---------------------------------------------------------------------------
+  # SPARK APP (client / driver)
+  # The container where we open a shell and run spark-submit.
+  # It does nothing on its own: it stays alive and waits for our commands.
+  # ---------------------------------------------------------------------------
+  spark-app:
+    image: spark-data-lake:3.5.6
+    container_name: sdl-spark-app
+    hostname: spark-app
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: ["tail", "-f", "/dev/null"]
+    environment:
+      SPARK_MASTER_URL: spark://spark-master:7077
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-ecommerce_dwh}
+      POSTGRES_USER: ${POSTGRES_USER:-dwh_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_in_local_env}
+    ports:
+      # Spark UI of the APPLICATION (the most useful one: DAG, stages, tasks,
+      # shuffle) -> http://localhost:4040 while a job is running.
+      - "${SPARK_APP_UI_PORT:-4040}:4040"
+      # JupyterLab (make notebook)
+      - "${JUPYTER_PORT:-8888}:8888"
+    volumes:
+      - ./:/opt/workspace
+      - ./docker/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./docker/spark/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
+    networks: [sdl-net]
+
+  # ---------------------------------------------------------------------------
+  # POSTGRESQL - the data warehouse
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: sdl-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-dwh_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_in_local_env}
+      POSTGRES_DB: ${POSTGRES_DB:-ecommerce_dwh}
+    ports:
+      # 5432/5433/5434 are already used by the other projects -> 5440
+      - "${POSTGRES_HOST_PORT:-5440}:5432"
+    volumes:
+      - sdl-pgdata:/var/lib/postgresql/data
+      # Scripts run only when the volume is first created
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dwh_user} -d ${POSTGRES_DB:-ecommerce_dwh}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [sdl-net]
+
+# Dedicated network: the containers reach each other by service name
+# (spark-master, postgres...) without exposing anything to the outside.
+networks:
+  sdl-net:
+    name: sdl-net
+    driver: bridge
+
+# Named volume: the PostgreSQL data survives "docker compose down".
+# It is only deleted by "docker compose down -v".
+volumes:
+  sdl-pgdata:
+    name: sdl-pgdata

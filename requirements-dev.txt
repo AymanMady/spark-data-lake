@@ -1,0 +1,11 @@
+# Dependencies to run the test suite OUTSIDE the Docker image
+# (your machine, or CI):   pip install -r requirements-dev.txt && pytest
+-r requirements.txt
+
+# PySpark is pinned to the version of the apache/spark image used by the
+# project. It matters: from Spark 4.0 on, ANSI mode is enabled by default and
+# to_timestamp() raises on an unparseable string instead of returning NULL,
+# which is exactly what the flexible date parsing in bronze_to_silver.py
+# relies on.
+pyspark==3.5.6
+ruff>=0.6,<1.0           # linter + formatter

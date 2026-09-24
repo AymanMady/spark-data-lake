@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Only ruff: linting does not need Spark, and pulling PySpark here
+      # would cost minutes for nothing.
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Lint the Python code
+        run: ruff check .
+
+      # A notebook is JSON. A corrupted one fails here instead of on open.
+      - name: Check the notebook is valid JSON
+        run: python -c "import json; json.load(open('notebooks/spark_exploration.ipynb'))"
+
+  compose:
+    name: Validate the Docker stack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `docker compose config` resolves every variable, image and volume.
+      # A typo in the stack fails here instead of at `make up` time.
+      - name: Validate docker-compose.yml
+        run: docker compose --env-file .env.example config --quiet
+
+  pipeline:
+    name: Tests and end-to-end pipeline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same image the project runs locally: Spark 3.5.6 + Python 3.10.
+      # Testing against a pip-installed PySpark would test a different stack.
+      # HOST_UID must match the runner's user, otherwise the container cannot
+      # write into the mounted workspace.
+      - name: Build the Spark image
+        run: HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose build spark-master
+
+      # The fixture asks for local[2]: no cluster needed, everything runs in
+      # the driver JVM.
+      - name: Unit tests
+        run: |
+          docker run --rm -v "$PWD":/opt/workspace -w /opt/workspace \
+            spark-data-lake:3.5.6 python3 -m pytest tests/ -q
+
+      # A dedicated network so the Spark container reaches PostgreSQL by name,
+      # exactly as docker-compose does locally.
+      - name: Start PostgreSQL
+        run: |
+          docker network create sdl-ci
+          docker run -d --name sdl-ci-pg --network sdl-ci \
+            -e POSTGRES_USER=dwh_user \
+            -e POSTGRES_PASSWORD=ci_password \
+            -e POSTGRES_DB=ecommerce_dwh \
+            postgres:16-alpine
+          for i in $(seq 1 30); do
+            docker exec sdl-ci-pg pg_isready -U dwh_user -d ecommerce_dwh && break
+            sleep 2
+          done
+          docker exec sdl-ci-pg psql -U dwh_user -d ecommerce_dwh \
+            -c "CREATE SCHEMA IF NOT EXISTS gold;"
+
+      # 20,000 orders instead of a million: CI is here to prove every stage
+      # runs and agrees, not to reproduce the benchmark.
+      # PROJECT_ROOT sends the data lake to /tmp so the checkout stays clean —
+      # the jobs derive every default path from it.
+      # --master local[2] overrides spark-defaults.conf, which points at the
+      # standalone cluster that does not exist here.
+      - name: Run RAW -> BRONZE -> SILVER -> GOLD -> PostgreSQL
+        run: |
+          docker run --rm --network sdl-ci -v "$PWD":/opt/workspace -w /opt/workspace \
+            -e PROJECT_ROOT=/tmp/ci \
+            -e POSTGRES_HOST=sdl-ci-pg -e POSTGRES_PORT=5432 \
+            -e POSTGRES_DB=ecommerce_dwh -e POSTGRES_USER=dwh_user \
+            -e POSTGRES_PASSWORD=ci_password \
+            spark-data-lake:3.5.6 bash -c '
+              set -e
+              mkdir -p /tmp/ci/data
+              python3 -m src.generator.generate_data \
+                --rows 20000 --seed 42 --output /tmp/ci/data/raw --clean
+              spark-submit --master "local[2]" src/spark/ingest_bronze.py \
+                --input /tmp/ci/data/raw --output /tmp/ci/data/bronze
+              spark-submit --master "local[2]" src/spark/bronze_to_silver.py \
+                --bronze /tmp/ci/data/bronze --output /tmp/ci/data/silver
+              spark-submit --master "local[2]" src/spark/silver_to_gold.py \
+                --silver /tmp/ci/data/silver --output /tmp/ci/data/gold
+              spark-submit --master "local[2]" src/spark/silver_to_gold.py --engine sql \
+                --silver /tmp/ci/data/silver --output /tmp/ci/data/gold_sql
+              spark-submit --master "local[2]" src/warehouse/load_postgres.py
+              # /tmp lives inside this container, which --rm destroys. Anything
+              # a later step needs has to be copied into the mounted workspace.
+              cp -r /tmp/ci/data/quality   /opt/workspace/ci-quality-reports
+              cp -r /tmp/ci/data/gold      /opt/workspace/ci-gold
+              cp -r /tmp/ci/data/gold_sql  /opt/workspace/ci-gold-sql
+            '
+
+      # The README claims the DataFrame API and Spark SQL produce strictly
+      # identical Gold tables. This is what keeps that claim true.
+      - name: Check both engines agree
+        run: |
+          docker run --rm -v "$PWD":/opt/workspace -w /opt/workspace \
+            spark-data-lake:3.5.6 python3 -c "
+          import pyarrow.parquet as pq
+          for t in ['daily_sales', 'product_sales', 'customer_sales', 'country_sales']:
+              a = pq.read_table(f'ci-gold/{t}').to_pandas().sort_index(axis=1)
+              b = pq.read_table(f'ci-gold-sql/{t}').to_pandas().sort_index(axis=1)
+              key = list(a.columns)[0]
+              a = a.sort_values(key).reset_index(drop=True)
+              b = b.sort_values(key).reset_index(drop=True)
+              assert a.equals(b), f'{t}: DataFrame API and Spark SQL diverge'
+              print(f'{t}: {len(a)} rows, identical')
+          "
+
+      # An empty table would mean the pipeline ran but loaded nothing.
+      - name: Check the warehouse was loaded
+        run: |
+          docker exec sdl-ci-pg psql -U dwh_user -d ecommerce_dwh -t -c "
+            SELECT CASE WHEN count(*) > 0 THEN 'ok' ELSE 'EMPTY' END
+            FROM gold.country_sales;" | grep -q ok
+          docker exec sdl-ci-pg psql -U dwh_user -d ecommerce_dwh -c "
+            SELECT country, orders_count, revenue
+            FROM gold.country_sales ORDER BY revenue DESC LIMIT 5;"
+
+      - name: Upload the data quality reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-reports
+          path: ci-quality-reports/
